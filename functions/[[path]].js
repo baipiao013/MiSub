@@ -122,7 +122,7 @@ async function generateCombinedNodeList(context) {
     
     const subPromises = httpSubs.map(async (sub) => {
         try {
-            const requestHeaders = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36' };
+            const requestHeaders = { 'User-Agent': 'v2rayN/6.45' };
             const response = await Promise.race([
                 fetch(new Request(sub.url, { headers: requestHeaders, redirect: "follow", cf: { insecureSkipVerify: true } })),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 10000))
@@ -156,11 +156,6 @@ async function generateCombinedNodeList(context) {
 }
 
 
-/**
- * [最终精简版主处理函数]
- * 采用【预处理 + POST提交】的稳定架构，并使用能发挥远程配置最大作用的参数。
- */
-// 请只替换 handleMisubRequest 这一个函数
 async function handleMisubRequest(context) {
     const { request, env } = context;
     const url = new URL(request.url);
@@ -189,101 +184,75 @@ async function handleMisubRequest(context) {
         if (ua.includes('sing-box')) targetFormat = 'singbox';
     }
 
-
-    // 1. 从 KV 中获取所有订阅项
-    const misubs = await env.MISUB_KV.get(KV_KEY_MAIN, 'json') || [];
-    const enabledMisubs = misubs.filter(sub => sub.enabled);
-
-    // 2. 分离手动节点和订阅链接
-    let manualNodesContent = '';
-    const subLinks = [];
-    for (const sub of enabledMisubs) {
-        if (sub.url.toLowerCase().startsWith('http')) {
-            subLinks.push(sub.url);
-        } else {
-            manualNodesContent += sub.url + '\n';
-        }
-    }
-    
-    // 3. 创建一个特殊的回调URL，专门用于处理手动节点
-    // 这是一个假的 token，仅用于内部回调，增加安全性
-    const fakeToken = (await crypto.subtle.digest('MD5', new TextEncoder().encode(token + 'manual'))).toString();
-    const callbackUrl = `${url.protocol}//${url.host}/sub?token=${fakeToken}&target=manual_nodes`;
-
-    // 4. 如果当前请求是这个特殊回调，则只返回手动节点的内容 (Base64)
-    if (url.searchParams.get('target') === 'manual_nodes' && token === fakeToken) {
-        return new Response(btoa(unescape(encodeURIComponent(manualNodesContent))));
-    }
-    
-    // 5. 将回调URL和所有其他订阅链接合并成一个清单，用 | 分隔
-    let finalUrlList = subLinks;
-    if (manualNodesContent.trim()) {
-        finalUrlList.unshift(callbackUrl); // 将手动节点的回调地址放在最前面
-    }
-    const urlParam = finalUrlList.join('|');
-
-    // 如果目标是 base64，则需自己下载所有内容（因为没有回调给 subconverter）
+    // 关键分流：根据目标格式，选择不同的处理模式
     if (targetFormat === 'base64') {
-        const subPromises = subLinks.map(link => 
-            fetch(link, { headers: { 'User-Agent': userAgentHeader }})
-            .then(res => res.ok ? res.text() : '')
-            .catch(() => '')
-        );
-        const subContents = await Promise.all(subPromises);
-        let allNodes = manualNodesContent;
-        subContents.forEach(content => {
-             try {
-                const decoded = atob(content.replace(/\s/g, ''));
-                allNodes += decoded + '\n';
-             } catch(e) {
-                allNodes += content + '\n';
-             }
-        });
-        const uniqueNodes = [...new Set(allNodes.split('\n').map(line => line.trim()).filter(line => line))].join('\n');
-        const base64Content = btoa(unescape(encodeURIComponent(uniqueNodes)));
-        return new Response(base64Content, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
-    }
+        // 对于 base64 (V2RayN), 使用【预处理模式】来确保编码正确，解决乱码
+        console.log('Using pre-fetch model for base64 target.');
+        const combinedNodeList = await generateCombinedNodeList(context);
+        const base64Content = btoa(unescape(encodeURIComponent(combinedNodeList)));
+        const headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
+        return new Response(base64Content, { headers });
+    } else {
+        // 对于 Clash 等, 使用【委托GET模式】，确保与后端兼容，解决502问题
+        console.log(`Using delegate model for ${targetFormat} target.`);
+        const misubs = await env.MISUB_KV.get(KV_KEY_MAIN, 'json') || [];
+        const enabledMisubs = misubs.filter(sub => sub.enabled);
 
-    // 6. 对于 Clash 等格式，将 URL 清单发送给 subconverter
-    const subconverterUrl = new URL(`https://${config.subConverter}/sub`);
-    subconverterUrl.searchParams.set('target', targetFormat);
-    subconverterUrl.searchParams.set('url', urlParam);
-    subconverterUrl.searchParams.set('config', config.subConfig);
-    // 使用能让 ACL4SSR 配置生效，且不报错的参数组合
-    subconverterUrl.searchParams.set('new_name', 'true');
-
-    try {
-        const subconverterResponse = await fetch(subconverterUrl.toString(), {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+        let manualNodesContent = '';
+        const subLinks = [];
+        for (const sub of enabledMisubs) {
+            if (sub.url.toLowerCase().startsWith('http')) {
+                subLinks.push(sub.url);
+            } else {
+                manualNodesContent += sub.url + '\n';
             }
-        });
-
-        // 如果转换失败，则返回 base64
-        if (!subconverterResponse.ok) {
-            console.error(`Subconverter failed, falling back to base64. Status: ${subconverterResponse.status}`);
-            return handleMisubRequest({
-                ...context,
-                request: new Request(`${url.protocol}//${url.host}/sub?token=${token}&target=base64`, request)
-            });
         }
+        
+        // 伪造一个回调URL来处理手动节点
+        const fakeToken = btoa(Math.random().toString()).slice(0, 10);
+        const callbackUrl = `${url.protocol}//${url.host}${url.pathname}?token=${token}&target=manual_nodes_${fakeToken}`;
 
-        const subconverterContent = await subconverterResponse.text();
-        const responseHeaders = new Headers(subconverterResponse.headers);
+        if (url.searchParams.get('target') === `manual_nodes_${fakeToken}`) {
+            return new Response(btoa(unescape(encodeURIComponent(manualNodesContent))));
+        }
+        
+        let finalUrlList = subLinks;
+        if (manualNodesContent.trim()) {
+            finalUrlList.unshift(callbackUrl);
+        }
+        const urlParam = finalUrlList.join('|');
 
-        responseHeaders.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(config.FileName)}`);
-        responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
-        responseHeaders.set('Cache-Control', 'no-store, no-cache');
+        const subconverterUrl = new URL(`https://${config.subConverter}/sub`);
+        subconverterUrl.searchParams.set('target', targetFormat);
+        subconverterUrl.searchParams.set('url', urlParam);
+        subconverterUrl.searchParams.set('config', config.subConfig);
+        subconverterUrl.searchParams.set('new_name', 'true');
 
-        return new Response(subconverterContent, {
-            status: subconverterResponse.status,
-            statusText: subconverterResponse.statusText,
-            headers: responseHeaders
-        });
+        try {
+            const subconverterResponse = await fetch(subconverterUrl.toString(), {
+                headers: { 'User-Agent': userAgentHeader }
+            });
 
-    } catch (error) {
-        console.error(`[MiSub Final Error] ${error.message}`);
-        return new Response(`Error connecting to subconverter: ${error.message}`, { status: 502 });
+            if (!subconverterResponse.ok) {
+                const errorBody = await subconverterResponse.text();
+                throw new Error(`Subconverter service returned status: ${subconverterResponse.status}. Body: ${errorBody}`);
+            }
+
+            const subconverterContent = await subconverterResponse.text();
+            const responseHeaders = new Headers(subconverterResponse.headers);
+            responseHeaders.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(config.FileName)}`);
+            responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
+            responseHeaders.set('Cache-Control', 'no-store, no-cache');
+
+            return new Response(subconverterContent, {
+                status: subconverterResponse.status,
+                statusText: subconverterResponse.statusText,
+                headers: responseHeaders
+            });
+        } catch (error) {
+            console.error(`[MiSub Final Error] ${error.message}`);
+            return new Response(`Error connecting to subconverter: ${error.message}`, { status: 502 });
+        }
     }
 }
 
