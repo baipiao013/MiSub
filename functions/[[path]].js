@@ -1,30 +1,52 @@
 import yaml from 'js-yaml';
 
 const OLD_KV_KEY = 'misub_data_v1';
-// --- 全局常量 ---
-// [修改] 将主数据键拆分，为订阅组（profiles）预留空间
 const KV_KEY_SUBS = 'misub_subscriptions_v1';
-const KV_KEY_PROFILES = 'misub_profiles_v1'; // 新增：用于存储订阅组
+const KV_KEY_PROFILES = 'misub_profiles_v1';
 const KV_KEY_SETTINGS = 'worker_settings_v1';
 const COOKIE_NAME = 'auth_session';
 const SESSION_DURATION = 8 * 60 * 60 * 1000;
 
+// --- [新] 默认设置中增加通知阈值 ---
 const defaultSettings = {
   FileName: 'MiSub',
   mytoken: 'auto',
-  subConverter: 'subapi.cmliussss.net',
+  subConverter: 'url.v1.mk',
   subConfig: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini',
-  prependSubName: true
+  prependSubName: true,
+  NotifyThresholdDays: 3, 
+  NotifyThresholdPercent: 90 
+};
+
+const formatBytes = (bytes, decimals = 2) => {
+  if (!+bytes || bytes < 0) return '0 B';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  // toFixed(dm) after dividing by pow(k, i) was producing large decimal numbers
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  if (i < 0) return '0 B'; // Handle log(0) case
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
 };
 
 // --- TG 通知函式 (无修改) ---
 async function sendTgNotification(settings, message) {
   if (!settings.BotToken || !settings.ChatID) {
     console.log("TG BotToken or ChatID not set, skipping notification.");
-    return;
+    return false;
   }
+  // 为所有消息添加时间戳
+  const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const fullMessage = `${message}\n\n*时间:* \`${now} (UTC+8)\``;
+  
   const url = `https://api.telegram.org/bot${settings.BotToken}/sendMessage`;
-  const payload = { chat_id: settings.ChatID, text: message, parse_mode: 'Markdown' };
+  const payload = { 
+    chat_id: settings.ChatID, 
+    text: fullMessage, 
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true // 禁用链接预览，使消息更紧凑
+  };
+  
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -33,12 +55,15 @@ async function sendTgNotification(settings, message) {
     });
     if (response.ok) {
       console.log("TG notification sent successfully.");
+      return true;
     } else {
       const errorData = await response.json();
-      console.error("Failed to send TG notification:", errorData);
+      console.error("Failed to send TG notification:", response.status, errorData);
+      return false;
     }
   } catch (error) {
     console.error("Error sending TG notification:", error);
+    return false;
   }
 }
 
@@ -69,6 +94,62 @@ async function authMiddleware(request, env) {
     const verifiedData = await verifySignedToken(env.COOKIE_SECRET, token);
     return verifiedData && (Date.now() - parseInt(verifiedData, 10) < SESSION_DURATION);
 }
+
+// sub: 要检查的订阅对象
+// settings: 全局设置
+// env: Cloudflare 环境
+async function checkAndNotify(sub, settings, env) {
+    if (!sub.userInfo) return; // 没有流量信息，无法检查
+
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    // 1. 检查订阅到期
+    if (sub.userInfo.expire) {
+        const expiryDate = new Date(sub.userInfo.expire * 1000);
+        const daysRemaining = Math.ceil((expiryDate - now) / ONE_DAY_MS);
+        
+        // 检查是否满足通知条件：剩余天数 <= 阈值
+        if (daysRemaining <= (settings.NotifyThresholdDays || 7)) {
+            // 检查上次通知时间，防止24小时内重复通知
+            if (!sub.lastNotifiedExpire || (now - sub.lastNotifiedExpire > ONE_DAY_MS)) {
+                const message = `🗓️ *订阅临期提醒* 🗓️\n\n*订阅名称:* \`${sub.name || '未命名'}\`\n*状态:* \`${daysRemaining < 0 ? '已过期' : `仅剩 ${daysRemaining} 天到期`}\`\n*到期日期:* \`${expiryDate.toLocaleDateString('zh-CN')}\``;
+                const sent = await sendTgNotification(settings, message);
+                if (sent) {
+                    sub.lastNotifiedExpire = now; // 更新通知时间戳
+                }
+            }
+        }
+    }
+
+    // 2. 检查流量使用
+    const { upload, download, total } = sub.userInfo;
+    if (total > 0) {
+        const used = upload + download;
+        const usagePercent = Math.round((used / total) * 100);
+
+        // 检查是否满足通知条件：已用百分比 >= 阈值
+        if (usagePercent >= (settings.NotifyThresholdPercent || 90)) {
+            // 检查上次通知时间，防止24小时内重复通知
+            if (!sub.lastNotifiedTraffic || (now - sub.lastNotifiedTraffic > ONE_DAY_MS)) {
+                const formatBytes = (bytes) => {
+                    if (!+bytes) return '0 B';
+                    const k = 1024;
+                    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+                    const i = Math.floor(Math.log(bytes) / Math.log(k));
+                    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
+                };
+                
+                const message = `📈 *流量预警提醒* 📈\n\n*订阅名称:* \`${sub.name || '未命名'}\`\n*状态:* \`已使用 ${usagePercent}%\`\n*详情:* \`${formatBytes(used)} / ${formatBytes(total)}\``;
+                const sent = await sendTgNotification(settings, message);
+                if (sent) {
+                    sub.lastNotifiedTraffic = now; // 更新通知时间戳
+                }
+            }
+        }
+    }
+}
+
 
 // --- 主要 API 請求處理 ---
 async function handleApiRequest(request, env) {
@@ -138,24 +219,41 @@ async function handleApiRequest(request, env) {
                 return new Response(JSON.stringify({ misubs, profiles, config }), { headers: { 'Content-Type': 'application/json' } });
             }
             case '/misubs': {
+                // [优化] 保存数据后，触发一次全面的检查
                 const { misubs, profiles } = await request.json();
                 if (typeof misubs === 'undefined' || typeof profiles === 'undefined') {
                     return new Response(JSON.stringify({ success: false, message: '请求体中缺少 misubs 或 profiles 字段' }), { status: 400 });
                 }
+                
+                // 获取最新设置用于通知
+                const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || defaultSettings;
+
+                // 遍历所有订阅进行检查
+                for (const sub of misubs) {
+                    if (sub.url.startsWith('http')) {
+                        await checkAndNotify(sub, settings, env);
+                    }
+                }
+
+                // 保存更新后的数据（包含了 lastNotified 时间戳）
                 await Promise.all([
                     env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(misubs)),
                     env.MISUB_KV.put(KV_KEY_PROFILES, JSON.stringify(profiles))
                 ]);
+                
                 return new Response(JSON.stringify({ success: true, message: '订阅源及订阅组已保存' }));
             }
             case '/node_count': {
-                 if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+                // [优化] 更新单个订阅后，立即检查并通知
+                if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
                 const { url: subUrl } = await request.json();
                 if (!subUrl || typeof subUrl !== 'string' || !/^https?:\/\//.test(subUrl)) {
                     return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
                 }
                 const result = { count: 0, userInfo: null };
-                try {
+                
+                 try {
+                    // ... (获取流量和节点数的逻辑无变化)
                     const trafficRequest = fetch(new Request(subUrl, { headers: { 'User-Agent': 'Clash for Windows/0.20.39' }, redirect: "follow" }));
                     const nodeCountRequest = fetch(new Request(subUrl, { headers: { 'User-Agent': 'MiSub-Node-Counter/2.0' }, redirect: "follow" }));
                     const [trafficResponse, nodeCountResponse] = await Promise.all([trafficRequest, nodeCountRequest]);
@@ -178,7 +276,7 @@ async function handleApiRequest(request, env) {
                         } catch {
                             decoded = text;
                         }
-                        const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?):\/\//gm);
+                        const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic):\/\//gm);
                         if (lineMatches) {
                             result.count = lineMatches.length;
                         }
@@ -186,9 +284,27 @@ async function handleApiRequest(request, env) {
                 } catch (e) {
                     console.error('Failed to fetch subscription with dual-request method:', e);
                 }
+                
+                // 如果成功获取到 userInfo，则进行检查
+                if(result.userInfo) {
+                    const allSubs = await env.MISUB_KV.get(KV_KEY_SUBS, 'json') || [];
+                    const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || defaultSettings;
+                    const subToUpdate = allSubs.find(s => s.url === subUrl);
+
+                    if (subToUpdate) {
+                        // 将新的 userInfo 合并到订阅对象中
+                        subToUpdate.userInfo = result.userInfo;
+                        // 检查并发送通知
+                        await checkAndNotify(subToUpdate, settings, env);
+                        // 保存更新了 `lastNotified` 时间戳的订阅列表
+                        await env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(allSubs));
+                    }
+                }
+                
                 return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
             }
             case '/settings': {
+                // [优化] 保存设置后，发送一条通知
                 if (request.method === 'GET') {
                     const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
                     return new Response(JSON.stringify({ ...defaultSettings, ...settings }), { headers: { 'Content-Type': 'application/json' } });
@@ -198,17 +314,20 @@ async function handleApiRequest(request, env) {
                     const oldSettings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
                     const finalSettings = { ...oldSettings, ...newSettings };
                     await env.MISUB_KV.put(KV_KEY_SETTINGS, JSON.stringify(finalSettings));
-                    const message = `🎉 MiSub 設定已成功更新！`;
+                    // 构造更丰富的通知消息
+                    const message = `⚙️ *MiSub 设置更新* ⚙️\n\n您的 MiSub 应用设置已成功更新。`;
                     await sendTgNotification(finalSettings, message);
                     return new Response(JSON.stringify({ success: true, message: '设置已保存' }));
                 }
                 return new Response('Method Not Allowed', { status: 405 });
             }
         }
-    } catch (e) { return new Response(JSON.stringify({ error: 'Internal Server Error' }), { status: 500 }); }
+    } catch (e) { 
+        console.error("API Error:", e);
+        return new Response(JSON.stringify({ error: 'Internal Server Error' }), { status: 500 });
+    }
     return new Response('API route not found', { status: 404 });
 }
-
 // --- 名称前缀辅助函数 (无修改) ---
 function prependNodeName(link, prefix) {
   if (!prefix) return link;
@@ -247,22 +366,17 @@ function prependNodeName(link, prefix) {
   return appendToFragment(link, prefix);
 }
 
-// --- 节点列表生成函数 (无修改) ---
-async function generateCombinedNodeList(context, config, userAgent, misubs) {
-    const enabledMisubs = misubs.filter(sub => sub.enabled);
-    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?):\/\//;
+// --- 节点列表生成函数 ---
+async function generateCombinedNodeList(context, config, userAgent, misubs, prependedContent = '') {
+    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//;
     let manualNodesContent = '';
     const normalizeVmessLink = (link) => {
-        if (!link.startsWith('vmess://')) {
-            return link;
-        }
+        if (!link.startsWith('vmess://')) return link;
         try {
             const base64Part = link.substring('vmess://'.length);
             const binaryString = atob(base64Part);
             const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
+            for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
             const jsonString = new TextDecoder('utf-8').decode(bytes);
             const compactJsonString = JSON.stringify(JSON.parse(jsonString));
             const newBase64Part = btoa(unescape(encodeURIComponent(compactJsonString)));
@@ -272,7 +386,7 @@ async function generateCombinedNodeList(context, config, userAgent, misubs) {
             return link;
         }
     };
-    const httpSubs = enabledMisubs.filter(sub => {
+    const httpSubs = misubs.filter(sub => {
         if (sub.url.toLowerCase().startsWith('http')) return true;
         manualNodesContent += sub.url + '\n';
         return false;
@@ -290,10 +404,7 @@ async function generateCombinedNodeList(context, config, userAgent, misubs) {
                 fetch(new Request(sub.url, { headers: requestHeaders, redirect: "follow", cf: { insecureSkipVerify: true } })),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 10000))
             ]);
-            if (!response.ok) {
-                console.error(`Failed to fetch sub: ${sub.url}, status: ${response.status}`);
-                return '';
-            }
+            if (!response.ok) return '';
             let text = await response.text();
             try {
                 const cleanedText = text.replace(/\s/g, '');
@@ -312,22 +423,22 @@ async function generateCombinedNodeList(context, config, userAgent, misubs) {
                     if (hashIndex === -1) return true;
                     const nodeName = decodeURIComponent(nodeLink.substring(hashIndex + 1));
                     return !nodeName.includes('https://');
-                } catch (e) {
-                    console.error(`Failed to decode node name, filtering it out: ${nodeLink}`, e);
-                    return false;
-                }
+                } catch (e) { return false; }
             });
             return (config.prependSubName && sub.name)
                 ? validNodes.map(node => prependNodeName(node, sub.name)).join('\n')
                 : validNodes.join('\n');
-        } catch (e) {
-            console.error(`Failed to fetch sub: ${sub.url}`, e);
-            return '';
-        }
+        } catch (e) { return ''; }
     });
     const processedSubContents = await Promise.all(subPromises);
     const combinedContent = (processedManualNodes + '\n' + processedSubContents.join('\n'));
-    return [...new Set(combinedContent.split('\n').map(line => line.trim()).filter(line => line))].join('\n');
+    const uniqueNodesString = [...new Set(combinedContent.split('\n').map(line => line.trim()).filter(line => line))].join('\n');
+
+    // 将虚假节点（如果存在）插入到列表最前面
+    if (prependedContent) {
+        return `${prependedContent}\n${uniqueNodesString}`;
+    }
+    return uniqueNodesString;
 }
 
 // --- [核心修改] 订阅处理函数 ---
@@ -336,7 +447,6 @@ async function handleMisubRequest(context) {
     const url = new URL(request.url);
     const userAgentHeader = request.headers.get('User-Agent') || "Unknown";
 
-    // 并行读取所有需要的数据
     const [settingsData, misubsData, profilesData] = await Promise.all([
         env.MISUB_KV.get(KV_KEY_SETTINGS, 'json'),
         env.MISUB_KV.get(KV_KEY_SUBS, 'json'),
@@ -345,43 +455,41 @@ async function handleMisubRequest(context) {
     const settings = settingsData || {};
     const allMisubs = misubsData || [];
     const allProfiles = profilesData || [];
-
     const config = { ...defaultSettings, ...settings };
 
-    // --- [核心修改] 订阅链接解析逻辑 ---
+    // --- [核心修改] 新的 URL 解析邏輯 ---
     let token = '';
-    let profileId = null;
-    const pathSegments = url.pathname.split('/').filter(Boolean); // e.g., ['sub', 'my_token', 'profile_123']
+    let profileIdentifier = null;
+    
+    const pathSegments = url.pathname.replace(/^\/sub\//, '/').split('/').filter(Boolean);
 
-    // 格式: /sub/{token} 或 /sub/{token}/{profileId}
-    if (pathSegments.length > 1 && pathSegments[0] === 'sub') {
-        token = pathSegments[1];
-        if (pathSegments.length > 2) {
-            profileId = pathSegments[2];
+    if (pathSegments.length > 0) {
+        token = pathSegments[0];
+        if (pathSegments.length > 1) {
+            profileIdentifier = pathSegments[1];
         }
     } else {
-         // 兼容旧格式 ?token=...
+        // 從查詢參數中取得 token 作為備用
         token = url.searchParams.get('token');
     }
 
-    // 验证 Token
     if (!token || token !== config.mytoken) {
-        // ... (省略了 callback_token 逻辑，因为它与新功能无关)
         return new Response('Invalid token', { status: 403 });
     }
-    // --- 链接解析结束 ---
+    // --- URL 解析結束 ---
 
     let targetMisubs;
-    let subName = config.FileName; // 默认文件名
+    let subName = config.FileName;
 
-    // 如果有 profileId，则根据 profile 筛选节点
-    if (profileId) {
-        const profile = allProfiles.find(p => p.id === profileId && p.enabled);
-        if (profile) {
-            subName = profile.name; // 使用订阅组的名称作为文件名
+    // 如果有 profileIdentifier，則根據 profile 篩選節點
+    if (profileIdentifier) {
+        // [核心修改] 優先使用 customId 尋找，其次用 id
+        const profile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
+        
+        if (profile && profile.enabled) {
+            subName = profile.name;
             const profileSubIds = new Set(profile.subscriptions);
             const profileNodeIds = new Set(profile.manualNodes);
-
             targetMisubs = allMisubs.filter(item => {
                 return (item.url.startsWith('http') ? profileSubIds.has(item.id) : profileNodeIds.has(item.id));
             });
@@ -389,26 +497,83 @@ async function handleMisubRequest(context) {
             return new Response('Profile not found or disabled', { status: 404 });
         }
     } else {
-        // 如果没有 profileId，则使用所有启用的节点
         targetMisubs = allMisubs.filter(s => s.enabled);
     }
 
+    let targetFormat = url.searchParams.get('target');
 
-    let targetFormat = url.searchParams.get('target') || 'base64';
-    if (!url.searchParams.has('target')) {
+    if (!targetFormat) {
+        const supportedFormats = ['clash', 'singbox', 'surge', 'loon', 'base64', 'v2ray', 'trojan'];
+        for (const format of supportedFormats) {
+            if (url.searchParams.has(format)) {
+                if (format === 'v2ray' || format === 'trojan') {
+                    targetFormat = 'base64';
+                } else {
+                    targetFormat = format;
+                }        
+                break;
+            }
+        }
+    }
+
+    if (!targetFormat) {
         const ua = userAgentHeader.toLowerCase();
-        if (ua.includes('clash')) targetFormat = 'clash';
-        if (ua.includes('sing-box')) targetFormat = 'singbox';
+        const uaMapping = {
+            'clash': 'clash',          // Clash for Windows, ClashX, Clash-Verge 等
+            'meta': 'clash',           // Clash Meta 客户端
+            'stash': 'clash',          // Stash (iOS Clash 客户端)
+            'nekoray': 'clash',        // NekoRay
+            'sing-box': 'singbox',     // Sing-Box 核心
+            'shadowrocket': 'base64',  // 小火箭 (Shadowrocket)
+            'v2rayn': 'base64',        // V2RayN
+            'v2rayng': 'base64',       // V2RayNG
+            'surge': 'surge',          // Surge
+            'loon': 'loon',            // Loon
+            'quantumult%20x': 'quanx', // Quantumult X (URL编码后)
+            'quantumult': 'quanx',     // Quantumult
+        };
+
+        for (const key in uaMapping) {
+            if (ua.includes(key)) {
+                targetFormat = uaMapping[key];
+                break;
+            }    
+        }    
+    }
+
+    if (!targetFormat) {
+        targetFormat = 'clash'; 
     }
 
     if (!url.searchParams.has('callback_token')) {
         const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
-        const message = `🚀 *MiSub 訂閱被存取* 🚀\n\n*客戶端 (User-Agent):*\n\`${userAgentHeader}\`\n\n*請求 IP:*\n\`${clientIp}\`\n*請求格式:*\n\`${targetFormat}\`${profileId ? `\n*訂閱組:*\n\`${subName}\`` : ''}`;
+        const country = request.headers.get('CF-IPCountry') || 'N/A';
+        let message = `🛰️ *订阅被访问* 🛰️\n\n*客户端:* \`${userAgentHeader}\`\n*IP 地址:* \`${clientIp} (${country})\`\n*请求格式:* \`${targetFormat}\``;
+        if (profileIdentifier) {
+            message += `\n*订阅组:* \`${subName}\``;
+        }
         context.waitUntil(sendTgNotification(config, message));
     }
 
-    // 将筛选后的列表传递给处理函数
-    const combinedNodeList = await generateCombinedNodeList(context, config, userAgentHeader, targetMisubs);
+    // 1. 计算当前请求的总剩余流量
+    const totalRemainingBytes = targetMisubs.reduce((acc, sub) => {
+        if (sub.enabled && sub.userInfo && sub.userInfo.total > 0) {
+            const used = (sub.userInfo.upload || 0) + (sub.userInfo.download || 0);
+            const remaining = sub.userInfo.total - used;
+            return acc + Math.max(0, remaining);
+        }
+        return acc;
+    }, 0);
+
+    // 2. 创建虚假节点字符串
+    const formattedTraffic = formatBytes(totalRemainingBytes);
+    const fakeNodeName = `总剩余流量: ${formattedTraffic}`;
+    // 使用一个无效的UUID和地址来创建节点，因为它只用于显示名称
+    const fakeNodeString = `vless://5abcc59a-cdbd-4969-8b3a-b4c99c56516a@104.25.252.184:8443?encryption=none&security=tls&sni=misub.pp.ua&fp=random&allowInsecure=1&type=ws&host=misub.pp.ua&path=%2F#${encodeURIComponent(fakeNodeName)}`;
+
+
+    // --- [优化] 调用 generateCombinedNodeList 时传入虚假节点 ---
+    const combinedNodeList = await generateCombinedNodeList(context, config, userAgentHeader, targetMisubs, fakeNodeString);
     const base64Content = btoa(unescape(encodeURIComponent(combinedNodeList)));
 
     if (targetFormat === 'base64') {
@@ -417,11 +582,9 @@ async function handleMisubRequest(context) {
     }
 
     const callbackToken = await getCallbackToken(env);
-    // [重要修改] 回调 URL 现在也需要包含 profileId (如果存在)
-    const callbackPath = profileId ? `/sub/${token}/${profileId}` : `/sub/${token}`;
+    const callbackPath = profileIdentifier ? `/${token}/${profileIdentifier}` : `/${token}`;
     const callbackUrl = `${url.protocol}//${url.host}${callbackPath}?target=base64&callback_token=${callbackToken}`;
     
-    // 如果是 subconverter 的回调请求，直接返回 base64 内容
     if (url.searchParams.get('callback_token') === callbackToken) {
          const headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
         return new Response(base64Content, { headers });
@@ -438,33 +601,48 @@ async function handleMisubRequest(context) {
             method: 'GET',
             headers: { 'User-Agent': 'Mozilla/5.0' },
         });
+
         if (!subconverterResponse.ok) {
             const errorBody = await subconverterResponse.text();
             throw new Error(`Subconverter service returned status: ${subconverterResponse.status}. Body: ${errorBody}`);
         }
-        let originalText = await subconverterResponse.text();
-        const correctedText = originalText
-            .replace(/^Proxy:/m, 'proxies:')
-            .replace(/^Proxy Group:/m, 'proxy-groups:')
-            .replace(/^Rule:/m, 'rules:');
+
+        const originalText = await subconverterResponse.text();
+        let correctedText;
+
+        try {
+            const parsedYaml = yaml.load(originalText);
+            const keyMappings = { 'Proxy': 'proxies', 'Proxy Group': 'proxy-groups', 'Rule': 'rules' };
+            for (const oldKey in keyMappings) {
+                if (parsedYaml[oldKey]) {
+                    const newKey = keyMappings[oldKey];
+                    parsedYaml[newKey] = parsedYaml[oldKey];
+                    delete parsedYaml[oldKey];
+                }
+            }
+            correctedText = yaml.dump(parsedYaml, { indent: 2, noArrayIndent: true });
+        } catch (e) {
+            console.error("YAML parsing/dumping failed, falling back to original text.", e);
+            correctedText = originalText.replace(/^Proxy:/m, 'proxies:').replace(/^Proxy Group:/m, 'proxy-groups:').replace(/^Rule:/m, 'rules:');
+        }
+        
         const responseHeaders = new Headers(subconverterResponse.headers);
-        // [重要修改] 文件名现在是动态的 (订阅组名或默认名)
         responseHeaders.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(subName)}`);
         responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
         responseHeaders.set('Cache-Control', 'no-store, no-cache');
+        
         return new Response(correctedText, {
             status: subconverterResponse.status,
             statusText: subconverterResponse.statusText,
             headers: responseHeaders
         });
+
     } catch (error) {
         console.error(`[MiSub Final Error] ${error.message}`);
         return new Response(`Error connecting to subconverter: ${error.message}`, { status: 502 });
     }
 }
 
-
-// --- 回调Token辅助函数 (无修改) ---
 async function getCallbackToken(env) {
     const secret = env.COOKIE_SECRET || 'default-callback-secret';
     const encoder = new TextEncoder();
@@ -479,23 +657,12 @@ async function getCallbackToken(env) {
 export async function onRequest(context) {
     const { request, env, next } = context;
     const url = new URL(request.url);
-    try {
-        if (url.pathname.startsWith('/api/')) {
-            return handleApiRequest(request, env);
-        }
-        if (url.pathname.startsWith('/sub/')) {
-            return handleMisubRequest(context);
-        }
-        if (url.pathname !== '/' && !url.pathname.includes('.') && !url.pathname.startsWith('/assets')) {
-            const newPath = `/sub${url.pathname}`;
-            const newUrl = new URL(newPath + url.search, url.origin);
-            const newRequest = new Request(newUrl, request);
-            const newContext = { ...context, request: newRequest };
-            return handleMisubRequest(newContext);
-        }
-        return next();
-    } catch (e) {
-        console.error("Critical error in onRequest:", e);
-        return new Response("Internal Server Error", { status: 500 });
+    if (url.pathname.startsWith('/api/')) {
+        return handleApiRequest(request, env);
     }
+    const isStaticAsset = /^\/(assets|@vite|src)\//.test(url.pathname) || /\.\w+$/.test(url.pathname);
+    if (!isStaticAsset && url.pathname !== '/') {
+        return handleMisubRequest(context);
+    }
+    return next();
 }
