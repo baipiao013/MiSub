@@ -260,6 +260,31 @@ const handleAutoSortNodes = () => {
 };
 
 const subsTotalPages = computed(() => Math.ceil(subscriptions.value.length / subsItemsPerPage));
+// 流量格式化函数，将字节转换为 GB/TB
+const formatBytes = (bytes, decimals = 2) => {
+  if (!+bytes || bytes < 0) return '0 B';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+};
+
+// 计算总剩余流量
+const totalRemainingTraffic = computed(() => {
+  const total = subscriptions.value.reduce((acc, sub) => {
+    // 只计算已启用且包含有效流量信息的订阅
+    if (sub.enabled && sub.userInfo && sub.userInfo.total > 0) {
+      const used = (sub.userInfo.upload || 0) + (sub.userInfo.download || 0);
+      const remaining = sub.userInfo.total - used;
+      // 剩余流量不能为负数
+      return acc + Math.max(0, remaining);
+    }
+    return acc;
+  }, 0);
+
+  return formatBytes(total);
+});
 const paginatedSubscriptions = computed(() => { const start = (subsCurrentPage.value - 1) * subsItemsPerPage; return subscriptions.value.slice(start, start + subsItemsPerPage); });
 const manualNodesTotalPages = computed(() => Math.ceil(manualNodes.value.length / manualNodesPerPage));
 const paginatedManualNodes = computed(() => { const start = (manualNodesCurrentPage.value - 1) * manualNodesPerPage; return manualNodes.value.slice(start, start + manualNodesPerPage); });
@@ -271,7 +296,15 @@ const paginatedManualNodes = computed(() => { const start = (manualNodesCurrentP
   </div>
   <div v-else class="w-full max-w-screen-xl mx-auto p-4 sm:p-6 lg:p-8">
     <div class="flex justify-between items-center mb-8">
-      <h1 class="text-2xl font-bold text-gray-800 dark:text-white">仪表盘</h1>
+      <div class="flex items-center gap-4">
+        <h1 class="text-2xl font-bold text-gray-800 dark:text-white">仪表盘</h1>
+        <span 
+          v-if="totalRemainingTraffic !== '0 B'"
+          class="px-3 py-1 text-sm font-semibold text-green-700 bg-green-100 dark:text-green-300 dark:bg-green-500/20 rounded-full"
+        >
+          剩余总流量: {{ totalRemainingTraffic }}
+        </span>
+      </div>
       <div class="flex items-center gap-2">
         <button @click="showBulkImportModal = true" class="text-sm font-semibold px-4 py-2 rounded-lg text-indigo-600 dark:text-indigo-400 border-2 border-indigo-500/50 hover:bg-indigo-500/10 transition-colors">批量导入</button>
       </div>
