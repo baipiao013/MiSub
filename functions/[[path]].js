@@ -11,6 +11,7 @@ const SESSION_DURATION = 8 * 60 * 60 * 1000;
 const defaultSettings = {
   FileName: 'MiSub',
   mytoken: 'auto',
+  profileToken: 'profiles',
   subConverter: 'url.v1.mk',
   subConfig: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini',
   prependSubName: true,
@@ -65,6 +66,46 @@ async function sendTgNotification(settings, message) {
     console.error("Error sending TG notification:", error);
     return false;
   }
+}
+
+async function handleCronTrigger(env) {
+    console.log("Cron trigger fired. Checking all subscriptions...");
+    const allSubs = await env.MISUB_KV.get(KV_KEY_SUBS, 'json') || [];
+    const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || defaultSettings;
+    let changesMade = false;
+
+    for (const sub of allSubs) {
+        if (sub.url.startsWith('http') && sub.enabled) {
+            // 複用 /api/node_count 的流量獲取邏輯
+            try {
+                const trafficRequest = fetch(new Request(sub.url, { headers: { 'User-Agent': 'Clash for Windows/0.20.39' }, redirect: "follow" }));
+                const response = await Promise.race([trafficRequest, new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))]);
+
+                if (response.ok) {
+                    const userInfoHeader = response.headers.get('subscription-userinfo');
+                    if (userInfoHeader) {
+                        const info = {};
+                        userInfoHeader.split(';').forEach(part => {
+                            const [key, value] = part.trim().split('=');
+                            if (key && value) info[key] = /^\d+$/.test(value) ? Number(value) : value;
+                        });
+                        sub.userInfo = info; // 更新流量信息
+                        await checkAndNotify(sub, settings, env); // 檢查並發送通知
+                        changesMade = true;
+                    }
+                }
+            } catch(e) {
+                console.error(`Cron: Failed to update ${sub.name}`, e.message);
+            }
+        }
+    }
+
+    // 如果有任何通知時間戳被更新，則保存回 KV
+    if (changesMade) {
+        await env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(allSubs));
+        console.log("Subscription notification timestamps updated.");
+    }
+    return new Response("Cron job finished.", { status: 200 });
 }
 
 // --- 认证与API处理的核心函数 (无修改) ---
@@ -215,8 +256,12 @@ async function handleApiRequest(request, env) {
                     env.MISUB_KV.get(KV_KEY_PROFILES, 'json').then(res => res || []),
                     env.MISUB_KV.get(KV_KEY_SETTINGS, 'json').then(res => res || {})
                 ]);
-                const config = { FileName: settings.FileName || 'MISUB', mytoken: settings.mytoken || 'auto' };
-                return new Response(JSON.stringify({ misubs, profiles, config }), { headers: { 'Content-Type': 'application/json' } });
+                const config = { 
+                    FileName: settings.FileName || 'MISUB', 
+                    mytoken: settings.mytoken || 'auto',
+                    profileToken: settings.profileToken || 'profiles' // 將 profileToken 也返回給前端
+                };
+                  return new Response(JSON.stringify({ misubs, profiles, config }), { headers: { 'Content-Type': 'application/json' } });
             }
             case '/misubs': {
                 // [优化] 保存数据后，触发一次全面的检查
@@ -282,24 +327,9 @@ async function handleApiRequest(request, env) {
                         }
                     }
                 } catch (e) {
-                    console.error('Failed to fetch subscription with dual-request method:', e);
+                    console.error('Failed to fetch subscription:', e);
                 }
                 
-                // 如果成功获取到 userInfo，则进行检查
-                if(result.userInfo) {
-                    const allSubs = await env.MISUB_KV.get(KV_KEY_SUBS, 'json') || [];
-                    const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || defaultSettings;
-                    const subToUpdate = allSubs.find(s => s.url === subUrl);
-
-                    if (subToUpdate) {
-                        // 将新的 userInfo 合并到订阅对象中
-                        subToUpdate.userInfo = result.userInfo;
-                        // 检查并发送通知
-                        await checkAndNotify(subToUpdate, settings, env);
-                        // 保存更新了 `lastNotified` 时间戳的订阅列表
-                        await env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(allSubs));
-                    }
-                }
                 
                 return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
             }
@@ -442,6 +472,7 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
 }
 
 // --- [核心修改] 订阅处理函数 ---
+// --- [最終修正版 - 變量名校對] 訂閱處理函數 ---
 async function handleMisubRequest(context) {
     const { request, env } = context;
     const url = new URL(request.url);
@@ -455,12 +486,11 @@ async function handleMisubRequest(context) {
     const settings = settingsData || {};
     const allMisubs = misubsData || [];
     const allProfiles = profilesData || [];
-    const config = { ...defaultSettings, ...settings };
+    // 關鍵：我們在這裡定義了 `config`，後續都應該使用它
+    const config = { ...defaultSettings, ...settings }; 
 
-    // --- [核心修改] 新的 URL 解析邏輯 ---
     let token = '';
     let profileIdentifier = null;
-    
     const pathSegments = url.pathname.replace(/^\/sub\//, '/').split('/').filter(Boolean);
 
     if (pathSegments.length > 0) {
@@ -469,93 +499,84 @@ async function handleMisubRequest(context) {
             profileIdentifier = pathSegments[1];
         }
     } else {
-        // 從查詢參數中取得 token 作為備用
         token = url.searchParams.get('token');
     }
 
-    if (!token || token !== config.mytoken) {
-        return new Response('Invalid token', { status: 403 });
-    }
-    // --- URL 解析結束 ---
-
     let targetMisubs;
     let subName = config.FileName;
+    let effectiveSubConverter;
+    let effectiveSubConfig;
 
-    // 如果有 profileIdentifier，則根據 profile 篩選節點
     if (profileIdentifier) {
-        // [核心修改] 優先使用 customId 尋找，其次用 id
+
+        // [修正] 使用 config 變量
+        if (!token || token !== config.profileToken) {
+            return new Response('Invalid Profile Token', { status: 403 });
+        }
         const profile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
-        
         if (profile && profile.enabled) {
             subName = profile.name;
             const profileSubIds = new Set(profile.subscriptions);
             const profileNodeIds = new Set(profile.manualNodes);
             targetMisubs = allMisubs.filter(item => {
-                return (item.url.startsWith('http') ? profileSubIds.has(item.id) : profileNodeIds.has(item.id));
+                if (item.url.startsWith('http')) {
+                    return item.enabled && profileSubIds.has(item.id);
+                }
+                return item.enabled && profileNodeIds.has(item.id);    
             });
+            effectiveSubConverter = profile.subConverter && profile.subConverter.trim() !== '' ? profile.subConverter : config.subConverter;
+            effectiveSubConfig = profile.subConfig && profile.subConfig.trim() !== '' ? profile.subConfig : config.subConfig;
         } else {
             return new Response('Profile not found or disabled', { status: 404 });
         }
     } else {
+        // [修正] 使用 config 變量
+        if (!token || token !== config.mytoken) {
+            return new Response('Invalid Token', { status: 403 });
+        }
         targetMisubs = allMisubs.filter(s => s.enabled);
+        // [修正] 使用 config 變量
+        effectiveSubConverter = config.subConverter;
+        effectiveSubConfig = config.subConfig;
     }
 
+    if (!effectiveSubConverter || effectiveSubConverter.trim() === '') {
+        return new Response('Subconverter backend is not configured.', { status: 500 });
+    }
+    
     let targetFormat = url.searchParams.get('target');
-
     if (!targetFormat) {
         const supportedFormats = ['clash', 'singbox', 'surge', 'loon', 'base64', 'v2ray', 'trojan'];
         for (const format of supportedFormats) {
             if (url.searchParams.has(format)) {
-                if (format === 'v2ray' || format === 'trojan') {
-                    targetFormat = 'base64';
-                } else {
-                    targetFormat = format;
-                }        
+                if (format === 'v2ray' || format === 'trojan') { targetFormat = 'base64'; } else { targetFormat = format; }
                 break;
             }
         }
     }
-
     if (!targetFormat) {
         const ua = userAgentHeader.toLowerCase();
         const uaMapping = {
-            'clash': 'clash',          // Clash for Windows, ClashX, Clash-Verge 等
-            'meta': 'clash',           // Clash Meta 客户端
-            'stash': 'clash',          // Stash (iOS Clash 客户端)
-            'nekoray': 'clash',        // NekoRay
-            'sing-box': 'singbox',     // Sing-Box 核心
-            'shadowrocket': 'base64',  // 小火箭 (Shadowrocket)
-            'v2rayn': 'base64',        // V2RayN
-            'v2rayng': 'base64',       // V2RayNG
-            'surge': 'surge',          // Surge
-            'loon': 'loon',            // Loon
-            'quantumult%20x': 'quanx', // Quantumult X (URL编码后)
-            'quantumult': 'quanx',     // Quantumult
+            'clash': 'clash', 'meta': 'clash', 'stash': 'clash', 'nekoray': 'clash',
+            'sing-box': 'singbox', 'shadowrocket': 'base64', 'v2rayn': 'base64',
+            'v2rayng': 'base64', 'surge': 'surge', 'loon': 'loon',
+            'quantumult%20x': 'quanx', 'quantumult': 'quanx',
         };
-
         for (const key in uaMapping) {
-            if (ua.includes(key)) {
-                targetFormat = uaMapping[key];
-                break;
-            }    
-        }    
+            if (ua.includes(key)) { targetFormat = uaMapping[key]; break; }
+        }
     }
-
-    if (!targetFormat) {
-        targetFormat = 'clash'; 
-    }
+    if (!targetFormat) { targetFormat = 'clash'; }
 
     if (!url.searchParams.has('callback_token')) {
         const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
         const country = request.headers.get('CF-IPCountry') || 'N/A';
         let message = `🛰️ *订阅被访问* 🛰️\n\n*客户端:* \`${userAgentHeader}\`\n*IP 地址:* \`${clientIp} (${country})\`\n*请求格式:* \`${targetFormat}\``;
-        if (profileIdentifier) {
-            message += `\n*订阅组:* \`${subName}\``;
-        }
+        if (profileIdentifier) { message += `\n*订阅组:* \`${subName}\``; }
         context.waitUntil(sendTgNotification(config, message));
     }
 
-    // 1. 计算当前请求的总剩余流量
+    let fakeNodeString = '';
     const totalRemainingBytes = targetMisubs.reduce((acc, sub) => {
         if (sub.enabled && sub.userInfo && sub.userInfo.total > 0) {
             const used = (sub.userInfo.upload || 0) + (sub.userInfo.download || 0);
@@ -564,15 +585,12 @@ async function handleMisubRequest(context) {
         }
         return acc;
     }, 0);
+    if (totalRemainingBytes > 0) {
+        const formattedTraffic = formatBytes(totalRemainingBytes);
+        const fakeNodeName = `流量剩余 ≫ ${formattedTraffic}`;
+        fakeNodeString = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#${encodeURIComponent(fakeNodeName)}`;
+    }
 
-    // 2. 创建虚假节点字符串
-    const formattedTraffic = formatBytes(totalRemainingBytes);
-    const fakeNodeName = `总剩余流量: ${formattedTraffic}`;
-    // 使用一个无效的UUID和地址来创建节点，因为它只用于显示名称
-    const fakeNodeString = `vless://5abcc59a-cdbd-4969-8b3a-b4c99c56516a@104.25.252.184:8443?encryption=none&security=tls&sni=misub.pp.ua&fp=random&allowInsecure=1&type=ws&host=misub.pp.ua&path=%2F#${encodeURIComponent(fakeNodeName)}`;
-
-
-    // --- [优化] 调用 generateCombinedNodeList 时传入虚假节点 ---
     const combinedNodeList = await generateCombinedNodeList(context, config, userAgentHeader, targetMisubs, fakeNodeString);
     const base64Content = btoa(unescape(encodeURIComponent(combinedNodeList)));
 
@@ -584,59 +602,34 @@ async function handleMisubRequest(context) {
     const callbackToken = await getCallbackToken(env);
     const callbackPath = profileIdentifier ? `/${token}/${profileIdentifier}` : `/${token}`;
     const callbackUrl = `${url.protocol}//${url.host}${callbackPath}?target=base64&callback_token=${callbackToken}`;
-    
     if (url.searchParams.get('callback_token') === callbackToken) {
-         const headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
+        const headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
         return new Response(base64Content, { headers });
     }
-
-    const subconverterUrl = new URL(`https://${config.subConverter}/sub`);
+    
+    const subconverterUrl = new URL(`https://${effectiveSubConverter}/sub`);
     subconverterUrl.searchParams.set('target', targetFormat);
     subconverterUrl.searchParams.set('url', callbackUrl);
-    subconverterUrl.searchParams.set('config', config.subConfig);
+    if (targetFormat === 'clash' && effectiveSubConfig && effectiveSubConfig.trim() !== '') {
+        subconverterUrl.searchParams.set('config', effectiveSubConfig);
+    }
     subconverterUrl.searchParams.set('new_name', 'true');
-
+    
     try {
         const subconverterResponse = await fetch(subconverterUrl.toString(), {
             method: 'GET',
             headers: { 'User-Agent': 'Mozilla/5.0' },
         });
-
         if (!subconverterResponse.ok) {
             const errorBody = await subconverterResponse.text();
             throw new Error(`Subconverter service returned status: ${subconverterResponse.status}. Body: ${errorBody}`);
         }
-
-        const originalText = await subconverterResponse.text();
-        let correctedText;
-
-        try {
-            const parsedYaml = yaml.load(originalText);
-            const keyMappings = { 'Proxy': 'proxies', 'Proxy Group': 'proxy-groups', 'Rule': 'rules' };
-            for (const oldKey in keyMappings) {
-                if (parsedYaml[oldKey]) {
-                    const newKey = keyMappings[oldKey];
-                    parsedYaml[newKey] = parsedYaml[oldKey];
-                    delete parsedYaml[oldKey];
-                }
-            }
-            correctedText = yaml.dump(parsedYaml, { indent: 2, noArrayIndent: true });
-        } catch (e) {
-            console.error("YAML parsing/dumping failed, falling back to original text.", e);
-            correctedText = originalText.replace(/^Proxy:/m, 'proxies:').replace(/^Proxy Group:/m, 'proxy-groups:').replace(/^Rule:/m, 'rules:');
-        }
-        
+        const responseText = await subconverterResponse.text();
         const responseHeaders = new Headers(subconverterResponse.headers);
         responseHeaders.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(subName)}`);
         responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
         responseHeaders.set('Cache-Control', 'no-store, no-cache');
-        
-        return new Response(correctedText, {
-            status: subconverterResponse.status,
-            statusText: subconverterResponse.statusText,
-            headers: responseHeaders
-        });
-
+        return new Response(responseText, { status: subconverterResponse.status, statusText: subconverterResponse.statusText, headers: responseHeaders });
     } catch (error) {
         console.error(`[MiSub Final Error] ${error.message}`);
         return new Response(`Error connecting to subconverter: ${error.message}`, { status: 502 });
@@ -657,6 +650,12 @@ async function getCallbackToken(env) {
 export async function onRequest(context) {
     const { request, env, next } = context;
     const url = new URL(request.url);
+
+    // **核心修改：判斷是否為定時觸發**
+    if (request.headers.get("cf-cron")) {
+        return handleCronTrigger(env);
+    }
+
     if (url.pathname.startsWith('/api/')) {
         return handleApiRequest(request, env);
     }
