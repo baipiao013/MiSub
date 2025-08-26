@@ -859,74 +859,6 @@ async function handleApiRequest(request, env) {
             }
         }
 
-        case '/debug_subscription': {
-            if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
-            const { url: subUrl, userAgent } = await request.json();
-            if (!subUrl || typeof subUrl !== 'string' || !/^https?:\/\//.test(subUrl)) {
-                return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
-            }
-
-            try {
-                const testUserAgent = userAgent || 'clash-verge/v2.3.1';
-                const response = await fetch(new Request(subUrl, {
-                    headers: { 'User-Agent': testUserAgent },
-                    redirect: "follow",
-                    cf: {
-                        insecureSkipVerify: true,
-                        allowUntrusted: true,
-                        validateCertificate: false
-                    }
-                }));
-
-                if (!response.ok) {
-                    return new Response(JSON.stringify({
-                        error: `HTTP ${response.status}: ${response.statusText}`,
-                        userAgent: testUserAgent
-                    }), { status: response.status });
-                }
-
-                let text = await response.text();
-                let isBase64 = false;
-
-                // 尝试Base64解码
-                try {
-                    const cleanedText = text.replace(/\s/g, '');
-                    if (isValidBase64(cleanedText)) {
-                        const binaryString = atob(cleanedText);
-                        const bytes = new Uint8Array(binaryString.length);
-                        for (let i = 0; i < binaryString.length; i++) { bytes[i] = binaryString.charCodeAt(i); }
-                        text = new TextDecoder('utf-8').decode(bytes);
-                        isBase64 = true;
-                    }
-                } catch (e) {
-                    // 解码失败，使用原始内容
-                }
-
-                const lines = text.split('\n').map(line => line.trim()).filter(line => line);
-                const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//g;
-                const validNodes = lines.filter(line => nodeRegex.test(line));
-                const hy2Nodes = lines.filter(line => /^(hysteria2|hy2):\/\//.test(line));
-
-                return new Response(JSON.stringify({
-                    success: true,
-                    userAgent: testUserAgent,
-                    isBase64: isBase64,
-                    totalLines: lines.length,
-                    validNodes: validNodes.length,
-                    hy2Nodes: hy2Nodes.length,
-                    hy2Examples: hy2Nodes.slice(0, 3),
-                    firstFewLines: lines.slice(0, 5),
-                    firstFewValidNodes: validNodes.slice(0, 5)
-                }), { headers: { 'Content-Type': 'application/json' } });
-
-            } catch (error) {
-                return new Response(JSON.stringify({
-                    error: error.message,
-                    userAgent: testUserAgent || 'clash-verge/v2.3.1'
-                }), { status: 500 });
-            }
-        }
-
         case '/settings': {
             if (request.method === 'GET') {
                 try {
@@ -1013,24 +945,17 @@ function isValidBase64(str) {
 
 /**
  * 根据客户端类型确定合适的用户代理
+ * 参考CF-Workers-SUB的优雅策略：统一使用v2rayN UA获取订阅，简单而有效
  * @param {string} originalUserAgent - 原始用户代理字符串
  * @returns {string} - 处理后的用户代理字符串
  */
-function getProcessedUserAgent(originalUserAgent) {
+function getProcessedUserAgent(originalUserAgent, url = '') {
     if (!originalUserAgent) return originalUserAgent;
     
-    const userAgent = originalUserAgent.toLowerCase();
-    
-    // 检测是否为clash-verge、mihomo part或shellcrash客户端
-    // 根据测试结果，clash-meta UA可以获取完整节点包括hy2，因此使用clash-meta来绕过机场过滤
-    if (userAgent.includes('clash-verge') || 
-        userAgent.includes('mihomo') || 
-        userAgent.includes('shellcrash')) {
-        return 'clash-meta/1.17.0';
-    }
-    
-    // 其他客户端保持原始 User-Agent
-    return originalUserAgent;
+    // CF-Workers-SUB的精华策略：
+    // 统一使用v2rayN UA获取订阅，绕过机场过滤同时保证获取完整节点
+    // 不需要复杂的客户端判断，简单而有效
+    return 'v2rayN/6.45';
 }
 
 // --- 节点列表生成函数 ---
@@ -1048,7 +973,7 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
     const subPromises = httpSubs.map(async (sub) => {
         try {
             // 使用处理后的用户代理
-            const processedUserAgent = getProcessedUserAgent(userAgent);
+            const processedUserAgent = getProcessedUserAgent(userAgent, sub.url);
             const requestHeaders = { 'User-Agent': processedUserAgent };
             const response = await Promise.race([
                 fetch(new Request(sub.url, { 
@@ -1068,12 +993,12 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
             }
             let text = await response.text();
             
-            // 智能内容类型检测
-            if (text.includes('proxies:')) {
-                // 对于Clash配置，可能需要特殊处理
+            // 智能内容类型检测 - 更精确的判断条件
+            if (text.includes('proxies:') && text.includes('rules:')) {
+                // 这是完整的Clash配置文件，不是节点列表
                 return '';
-            } else if (text.includes('outbounds"') && text.includes('inbounds"')) {
-                // 对于Singbox配置，可能需要特殊处理  
+            } else if (text.includes('outbounds') && text.includes('inbounds') && text.includes('route')) {
+                // 这是完整的Singbox配置文件，不是节点列表
                 return '';
             }
             try {
@@ -1088,7 +1013,7 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
                 // Base64解码失败，使用原始内容
             }
             let validNodes = text.replace(/\r\n/g, '\n').split('\n')
-                .map(line => line.trim()).filter(line => nodeRegex.test(line));
+                .map(line => line.trim()).filter(line => /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//.test(line));
 
             // [核心重構] 引入白名單 (keep:) 和黑名單 (exclude) 模式
             if (sub.exclude && sub.exclude.trim() !== '') {
@@ -1174,6 +1099,7 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
                     });
                 }
             }
+            
             return (config.prependSubName && sub.name)
                 ? validNodes.map(node => prependNodeName(node, sub.name)).join('\n')
                 : validNodes.join('\n');
@@ -1310,7 +1236,7 @@ async function handleMisubRequest(context) {
         const ua = userAgentHeader.toLowerCase();
         // 使用陣列來保證比對的優先順序
         const uaMapping = [
-            // 優先匹配 Mihomo/Meta 核心的客戶端
+            // Mihomo/Meta 核心的客戶端 - 需要clash格式
             ['flyclash', 'clash'],
             ['mihomo', 'clash'],
             ['clash.meta', 'clash'],
@@ -1424,6 +1350,7 @@ async function handleMisubRequest(context) {
             throw new Error(`Subconverter service returned status: ${subconverterResponse.status}. Body: ${errorBody}`);
         }
         const responseText = await subconverterResponse.text();
+        
         const responseHeaders = new Headers(subconverterResponse.headers);
         responseHeaders.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(subName)}`);
         responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
