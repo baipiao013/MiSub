@@ -310,7 +310,11 @@ async function sendEnhancedTgNotification(settings, type, clientIp, additionalDa
     if (response.ok) {
       const ipInfo = await response.json();
       if (ipInfo.status === 'success') {
-        locationInfo = `\n*国家:* \`${ipInfo.country || 'N/A'}\`\n*城市:* \`${ipInfo.city || 'N/A'}\`\n*ISP:* \`${ipInfo.org || 'N/A'}\`\n*ASN:* \`${ipInfo.as || 'N/A'}\``;
+        locationInfo = `
+*国家:* \`${ipInfo.country || 'N/A'}\`
+*城市:* \`${ipInfo.city || 'N/A'}\`
+*ISP:* \`${ipInfo.org || 'N/A'}\`
+*ASN:* \`${ipInfo.as || 'N/A'}\``;
       }
     }
   } catch (error) {
@@ -319,7 +323,13 @@ async function sendEnhancedTgNotification(settings, type, clientIp, additionalDa
   
   // 构建完整消息
   const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-  const message = `${type}\n\n*IP 地址:* \`${clientIp}\`${locationInfo}\n\n${additionalData}\n\n*时间:* \`${now} (UTC+8)\``;
+  const message = `${type}
+
+*IP 地址:* \`${clientIp}\`${locationInfo}
+
+${additionalData}
+
+*时间:* \`${now} (UTC+8)\``;
   
   const url = `https://api.telegram.org/bot${settings.BotToken}/sendMessage`;
   const payload = { 
@@ -465,7 +475,11 @@ async function checkAndNotify(sub, settings, env) {
         if (daysRemaining <= (settings.NotifyThresholdDays || 7)) {
             // 检查上次通知时间，防止24小时内重复通知
             if (!sub.lastNotifiedExpire || (now - sub.lastNotifiedExpire > ONE_DAY_MS)) {
-                const message = `🗓️ *订阅临期提醒* 🗓️\n\n*订阅名称:* \`${sub.name || '未命名'}\`\n*状态:* \`${daysRemaining < 0 ? '已过期' : `仅剩 ${daysRemaining} 天到期`}\`\n*到期日期:* \`${expiryDate.toLocaleDateString('zh-CN')}\``;
+                const message = `🗓️ *订阅临期提醒* 🗓️
+
+*订阅名称:* \`${sub.name || '未命名'}\`
+*状态:* \`${daysRemaining < 0 ? '已过期' : `仅剩 ${daysRemaining} 天到期`}\`
+*到期日期:* \`${expiryDate.toLocaleDateString('zh-CN')}\``;
                 const sent = await sendTgNotification(settings, message);
                 if (sent) {
                     sub.lastNotifiedExpire = now; // 更新通知时间戳
@@ -492,7 +506,11 @@ async function checkAndNotify(sub, settings, env) {
                     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
                 };
                 
-                const message = `📈 *流量预警提醒* 📈\n\n*订阅名称:* \`${sub.name || '未命名'}\`\n*状态:* \`已使用 ${usagePercent}%\`\n*详情:* \`${formatBytes(used)} / ${formatBytes(total)}\``;
+                const message = `📈 *流量预警提醒* 📈
+
+*订阅名称:* \`${sub.name || '未命名'}\`
+*状态:* \`已使用 ${usagePercent}%\`
+*详情:* \`${formatBytes(used)} / ${formatBytes(total)}\``;
                 const sent = await sendTgNotification(settings, message);
                 if (sent) {
                     sub.lastNotifiedTraffic = now; // 更新通知时间戳
@@ -896,6 +914,128 @@ async function handleApiRequest(request, env) {
             }
         }
 
+        case '/debug_subscription': {
+            if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+            
+            try {
+                const { url: debugUrl, userAgent } = await request.json();
+                if (!debugUrl || typeof debugUrl !== 'string' || !/^https?:\/\//.test(debugUrl)) {
+                    return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
+                }
+                
+                const result = {
+                    url: debugUrl,
+                    userAgent: userAgent || 'MiSub-Debug/1.0',
+                    success: false,
+                    rawContent: '',
+                    processedContent: '',
+                    validNodes: [],
+                    ssNodes: [],
+                    error: null
+                };
+                
+                try {
+                    const response = await fetch(new Request(debugUrl, {
+                        headers: { 'User-Agent': result.userAgent },
+                        redirect: "follow",
+                        cf: { insecureSkipVerify: true }
+                    }));
+                    
+                    if (!response.ok) {
+                        result.error = `HTTP ${response.status}: ${response.statusText}`;
+                        return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+                    }
+                    
+                    const text = await response.text();
+                    result.rawContent = text.substring(0, 2000); // 限制原始内容长度
+                    
+                    // 处理Base64解码
+                    let processedText = text;
+                    try {
+                        const cleanedText = text.replace(/\s/g, '');
+                        if (isValidBase64(cleanedText)) {
+                            const binaryString = atob(cleanedText);
+                            const bytes = new Uint8Array(binaryString.length);
+                            for (let i = 0; i < binaryString.length; i++) { bytes[i] = binaryString.charCodeAt(i); }
+                            processedText = new TextDecoder('utf-8').decode(bytes);
+                        }
+                    } catch (e) {
+                        // Base64解码失败，使用原始内容
+                    }
+                    
+                    result.processedContent = processedText.substring(0, 2000); // 限制处理后内容长度
+                    
+                    // 提取所有有效节点
+                    const allNodes = processedText.replace(/\r\n/g, '\n').split('\n')
+                        .map(line => line.trim())
+                        .filter(line => /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//.test(line));
+                    
+                    result.validNodes = allNodes.slice(0, 20); // 限制显示节点数量
+                    
+                    // 特别提取SS节点进行分析
+                    result.ssNodes = allNodes.filter(line => line.startsWith('ss://')).map(line => {
+                        try {
+                            const hashIndex = line.indexOf('#');
+                            let baseLink = hashIndex !== -1 ? line.substring(0, hashIndex) : line;
+                            let fragment = hashIndex !== -1 ? line.substring(hashIndex) : '';
+                            
+                            const protocolEnd = baseLink.indexOf('://');
+                            const atIndex = baseLink.indexOf('@');
+                            let analysis = {
+                                original: line,
+                                hasUrlEncoding: false,
+                                fixed: line,
+                                base64Part: '',
+                                credentials: ''
+                            };
+                            
+                            if (protocolEnd !== -1 && atIndex !== -1) {
+                                const base64Part = baseLink.substring(protocolEnd + 3, atIndex);
+                                analysis.base64Part = base64Part;
+                                
+                                if (base64Part.includes('%')) {
+                                    analysis.hasUrlEncoding = true;
+                                    const decodedBase64 = decodeURIComponent(base64Part);
+                                    analysis.fixed = 'ss://' + decodedBase64 + baseLink.substring(atIndex) + fragment;
+                                    
+                                    try {
+                                        analysis.credentials = atob(decodedBase64);
+                                    } catch (e) {
+                                        analysis.credentials = 'Base64解码失败: ' + e.message;
+                                    }
+                                } else {
+                                    try {
+                                        analysis.credentials = atob(base64Part);
+                                    } catch (e) {
+                                        analysis.credentials = 'Base64解码失败: ' + e.message;
+                                    }
+                                }
+                            }
+                            
+                            return analysis;
+                        } catch (e) {
+                            return {
+                                original: line,
+                                error: e.message
+                            };
+                        }
+                    }).slice(0, 10); // 限制SS节点分析数量
+                    
+                    result.success = true;
+                    result.totalNodes = allNodes.length;
+                    result.ssNodesCount = allNodes.filter(line => line.startsWith('ss://')).length;
+                    
+                } catch (e) {
+                    result.error = e.message;
+                }
+                
+                return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+                
+            } catch (e) {
+                return new Response(JSON.stringify({ error: `调试失败: ${e.message}` }), { status: 500 });
+            }
+        }
+
         case '/settings': {
             if (request.method === 'GET') {
                 try {
@@ -1013,7 +1153,32 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
         if (node.isExpiredNode) {
             return node.url; // Directly use the URL for expired node
         } else {
-            return shouldPrependManualNodes ? prependNodeName(node.url, manualNodePrefix) : node.url;
+            // 修复手动SS节点中的URL编码问题
+            let processedUrl = node.url;
+            if (processedUrl.startsWith('ss://')) {
+                try {
+                    const hashIndex = processedUrl.indexOf('#');
+                    let baseLink = hashIndex !== -1 ? processedUrl.substring(0, hashIndex) : processedUrl;
+                    let fragment = hashIndex !== -1 ? processedUrl.substring(hashIndex) : '';
+                    
+                    // 检查base64部分是否包含URL编码字符
+                    const protocolEnd = baseLink.indexOf('://');
+                    const atIndex = baseLink.indexOf('@');
+                    if (protocolEnd !== -1 && atIndex !== -1) {
+                        const base64Part = baseLink.substring(protocolEnd + 3, atIndex);
+                        if (base64Part.includes('%')) {
+                            // 解码URL编码的base64部分
+                            const decodedBase64 = decodeURIComponent(base64Part);
+                            baseLink = 'ss://' + decodedBase64 + baseLink.substring(atIndex);
+                        }
+                    }
+                    processedUrl = baseLink + fragment;
+                } catch (e) {
+                    // 如果处理失败，使用原始链接
+                }
+            }
+            
+            return shouldPrependManualNodes ? prependNodeName(processedUrl, manualNodePrefix) : processedUrl;
         }
     }).join('\n');
 
@@ -1061,7 +1226,35 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
                 // Base64解码失败，使用原始内容
             }
             let validNodes = text.replace(/\r\n/g, '\n').split('\n')
-                .map(line => line.trim()).filter(line => /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//.test(line));
+                .map(line => line.trim())
+                .filter(line => /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//.test(line))
+                .map(line => {
+                    // 修复SS节点中的URL编码问题
+                    if (line.startsWith('ss://')) {
+                        try {
+                            const hashIndex = line.indexOf('#');
+                            let baseLink = hashIndex !== -1 ? line.substring(0, hashIndex) : line;
+                            let fragment = hashIndex !== -1 ? line.substring(hashIndex) : '';
+                            
+                            // 检查base64部分是否包含URL编码字符
+                            const protocolEnd = baseLink.indexOf('://');
+                            const atIndex = baseLink.indexOf('@');
+                            if (protocolEnd !== -1 && atIndex !== -1) {
+                                const base64Part = baseLink.substring(protocolEnd + 3, atIndex);
+                                if (base64Part.includes('%')) {
+                                    // 解码URL编码的base64部分
+                                    const decodedBase64 = decodeURIComponent(base64Part);
+                                    baseLink = 'ss://' + decodedBase64 + baseLink.substring(atIndex);
+                                }
+                            }
+                            return baseLink + fragment;
+                        } catch (e) {
+                            // 如果处理失败，返回原始链接
+                            return line;
+                        }
+                    }
+                    return line;
+                });
 
             // [核心重構] 引入白名單 (keep:) 和黑名單 (exclude) 模式
             if (sub.exclude && sub.exclude.trim() !== '') {
